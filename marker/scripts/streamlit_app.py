@@ -9,6 +9,7 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 import base64
 import io
+import zipfile
 import json
 import re
 import string
@@ -74,7 +75,9 @@ def load_models():
     return create_model_dict()
 
 
-def convert_pdf(fname: str, config_parser: ConfigParser) -> (str, Dict[str, Any], dict):
+from typing import Tuple # Import Tuple if not already imported, or rely on Python 3.9+ tuple[]
+
+def convert_pdf(fname: str, config_parser: ConfigParser) -> tuple[str, Dict[str, Any], dict]:
     config_dict = config_parser.generate_config_dict()
     config_dict["pdftext_workers"] = 1
     converter_cls = PdfConverter
@@ -115,16 +118,34 @@ def markdown_insert_images(markdown, images):
 
 
 @st.cache_data()
-def get_page_image(pdf_file, page_num, dpi=96):
-    if "pdf" in pdf_file.type:
-        doc = open_pdf(pdf_file)
-        page = doc[page_num]
-        png_image = page.render(
-            scale=dpi / 72,
-        ).to_pil().convert("RGB")
+def get_page_image(uploaded_file: UploadedFile, page_num, dpi=96):
+    """Tries to render a preview image for the uploaded file."""
+    file_type = uploaded_file.type
+    # Handle PDF
+    if "pdf" in file_type:
+        try:
+            doc = open_pdf(uploaded_file)
+            if page_num < len(doc):
+                page = doc[page_num]
+                png_image = page.render(scale=dpi / 72).to_pil().convert("RGB")
+                return png_image
+            else:
+                # Handle invalid page number for PDF
+                return None # Or a placeholder image/error message
+        except Exception as e:
+            print(f"Error rendering PDF preview: {e}")
+            return None # Failed to render PDF page
+    # Handle common image types
+    elif file_type in ["image/png", "image/jpeg", "image/gif"]:
+        try:
+            png_image = Image.open(uploaded_file).convert("RGB")
+            return png_image
+        except Exception as e:
+            print(f"Error opening image preview: {e}")
+            return None # Failed to open image
+    # Handle other types (EPUB, DOCX, etc.) - no direct preview
     else:
-        png_image = Image.open(pdf_file).convert("RGB")
-    return png_image
+        return None
 
 
 @st.cache_data()
@@ -171,20 +192,10 @@ model_dict = load_models()
 cli_options = parse_args()
 
 
-st.markdown("""
-# Marker Demo
-
-This app will let you try marker, a PDF or image -> Markdown, HTML, JSON converter. It works with any language, and extracts images, tables, equations, etc.
-
-Find the project [here](https://github.com/VikParuchuri/marker).
-""")
-
 in_file: UploadedFile = st.sidebar.file_uploader("PDF, document, or image file:", type=["pdf", "png", "jpg", "jpeg", "gif", "pptx", "docx", "xlsx", "html", "epub"])
 
 if in_file is None:
     st.stop()
-
-filetype = in_file.type
 
 with col1:
     page_count = page_count(in_file)
@@ -192,19 +203,43 @@ with col1:
     pil_image = get_page_image(in_file, page_number)
     image_placeholder = st.empty()
 
-    with image_placeholder:
-        block_display(pil_image)
+    # Display image or placeholder message
+    with image_placeholder.container(): # Use container to manage content replacement
+        if pil_image:
+            block_display(pil_image)
+        else:
+            st.warning(f"Preview not available for file type '{in_file.type}' or page number {page_number}.")
 
-
-page_range = st.sidebar.text_input("Page range to parse, comma separated like 0,5-10,20", value=f"{page_number}-{page_number}")
+page_range = st.sidebar.text_input("Page range to parse", value="", placeholder="Leave blank for all pages", help="Specify comma separated page numbers or ranges (e.g., 0,5-10,20). Leave blank to process the entire document.")
 output_format = st.sidebar.selectbox("Output format", ["markdown", "json", "html"], index=0)
 run_marker = st.sidebar.button("Run Marker")
 
 use_llm = st.sidebar.checkbox("Use LLM", help="Use LLM for higher quality processing", value=False)
-show_blocks = st.sidebar.checkbox("Show Blocks", help="Display detected blocks, only when output is JSON", value=False, disabled=output_format != "json")
+
+if use_llm:
+    st.sidebar.subheader("OpenAI Configuration")
+    # Use session_state keys for persistence across reruns
+    openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password", key="openai_api_key")
+    openai_model = st.sidebar.text_input("OpenAI Model Name", value="gpt-4o", key="openai_model")
+    openai_base_url = st.sidebar.text_input("OpenAI Base URL (Optional)", key="openai_base_url")
+# show_blocks = st.sidebar.checkbox("Show Blocks", help="Display detected blocks, only when output is JSON", value=False, disabled=output_format != "json")
 force_ocr = st.sidebar.checkbox("Force OCR", help="Force OCR on all pages", value=False)
-strip_existing_ocr = st.sidebar.checkbox("Strip existing OCR", help="Strip existing OCR text from the PDF and re-OCR.", value=False)
-debug = st.sidebar.checkbox("Debug", help="Show debug information", value=False)
+
+# Display active device status
+active_device = settings.TORCH_DEVICE_MODEL
+if active_device == "cuda":
+    st.sidebar.success("✅ Nvidia GPU (CUDA) Acceleration Active")
+elif active_device == "mps":
+    st.sidebar.success("✅ Apple Silicon (MPS) Acceleration Active")
+else:
+    st.sidebar.info(f"ℹ️ Running on CPU ({active_device})")
+
+# languages = st.sidebar.text_input(
+#     "OCR Languages (optional)",
+#     value="",
+#     placeholder="Comma-separated, e.g., en,zh",
+#     help="Specify languages for OCR if needed (e.g., 'zh' for Chinese). Leave blank for default/auto-detect."
+# )
 
 if not run_marker:
     st.stop()
@@ -215,24 +250,103 @@ with tempfile.TemporaryDirectory() as tmp_dir:
     with open(temp_pdf, 'wb') as f:
         f.write(in_file.getvalue())
     
+    # Update the main cli_options dictionary with base settings and languages
     cli_options.update({
         "output_format": output_format,
         "page_range": page_range,
         "force_ocr": force_ocr,
-        "debug": debug,
-        "output_dir": settings.DEBUG_DATA_FOLDER if debug else None,
-        "use_llm": use_llm,
-        "strip_existing_ocr": strip_existing_ocr
+        "use_llm": use_llm, # Pass the checkbox state
+        # "languages": languages if languages else None # Add languages if provided
     })
+
+    # Now add the potentially updated LLM options from session state if use_llm is True
+    if use_llm:
+         # Check if the key exists in session state (meaning the input field was rendered and potentially filled)
+         if 'openai_api_key' in st.session_state and st.session_state.openai_api_key:
+             cli_options["llm_service"] = "marker.services.openai.OpenAIService"
+             cli_options["openai_api_key"] = st.session_state.openai_api_key
+             if 'openai_model' in st.session_state and st.session_state.openai_model:
+                 cli_options["openai_model"] = st.session_state.openai_model
+             if 'openai_base_url' in st.session_state and st.session_state.openai_base_url:
+                 cli_options["openai_base_url"] = st.session_state.openai_base_url
+         # else: # Optional: Handle if 'Use LLM' is checked but no OpenAI key is provided
+         #    # Maybe default back to Gemini or show a warning? For now, do nothing.
+    # Ensure llm_service is removed if use_llm is unchecked and was previously set
+    elif "llm_service" in cli_options:
+         del cli_options["llm_service"]
+         # Also remove related keys if they exist
+         cli_options.pop("openai_api_key", None)
+         cli_options.pop("openai_model", None)
+         cli_options.pop("openai_base_url", None)
+
+
     config_parser = ConfigParser(cli_options)
     rendered = convert_pdf(
         temp_pdf,
         config_parser
     )
-    page_range = config_parser.generate_config_dict()["page_range"]
-    first_page = page_range[0] if page_range else 0
+    # Safely get page_range from config, defaulting to None if not specified (all pages)
+    config_dict_for_page = config_parser.generate_config_dict()
+    page_range_from_config = config_dict_for_page.get("page_range", None)
+    # Determine first page for potential debug output, default to 0 if range is not set or empty
+    first_page = page_range_from_config[0] if page_range_from_config else 0
 
 text, ext, images = text_from_rendered(rendered)
+
+# Create zip file in memory for download
+# Get the base name from the original uploaded file
+original_filename = in_file.name
+base_filename = os.path.splitext(original_filename)[0]
+zip_buffer = io.BytesIO()
+with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+    # Determine the primary file extension based on output format
+    primary_extension = "md" # Default to markdown
+    if output_format == "json":
+        primary_extension = "json"
+    elif output_format == "html":
+        primary_extension = "html"
+
+    # Prepare primary output content
+    output_content = text
+    if output_format == "markdown" and images:
+        # Modify markdown text to update image paths
+        def replace_image_path(match):
+            alt_text = match.group(1)
+            original_path = match.group(2)
+            # Ensure the new path starts with 'images/' and handles potential leading slashes
+            new_path = f"images/{original_path.lstrip('/')}"
+            return f"![{alt_text}]({new_path})"
+        # Use regex to find markdown image links: ![alt](path)
+        output_content = re.sub(r'!\[(.*?)\]\((.*?)\)', replace_image_path, text)
+
+    # Write primary output file (md, json, or html)
+    primary_filename = f"{base_filename}.{primary_extension}"
+    # Use the potentially modified output_content
+    zip_file.writestr(primary_filename, output_content.encode('utf-8') if isinstance(output_content, str) else json.dumps(output_content, indent=2).encode('utf-8'))
+
+    # Write image files if the output format is markdown and images exist
+    if output_format == "markdown" and images: # images should be available
+        for img_path, img_obj in images.items():
+            try:
+                img_byte_arr = io.BytesIO()
+                # Determine image format, default to PNG if unknown
+                img_format = img_obj.format if hasattr(img_obj, 'format') and img_obj.format else 'PNG'
+                img_obj.save(img_byte_arr, format=img_format)
+                # Ensure img_path is a valid path within the zip, place it in 'images/' subdirectory
+                zip_img_path = f"images/{img_path.lstrip('/')}"
+                # Create the directory structure if needed (ZipFile handles this implicitly when writing)
+                zip_file.writestr(zip_img_path, img_byte_arr.getvalue())
+            except Exception as e:
+                st.sidebar.error(f"Error saving image {img_path}: {e}") # Optional: show error in UI
+
+# Offer zip file for download via sidebar
+st.sidebar.download_button(
+    label="Download Results (.zip)",
+    data=zip_buffer.getvalue(),
+    file_name=f"{base_filename}_marker_output.zip",
+    mime="application/zip",
+    key="download_zip_button" # Update key if needed
+)
 with col2:
     if output_format == "markdown":
         text = markdown_insert_images(text, images)
@@ -241,20 +355,3 @@ with col2:
         st.json(text)
     elif output_format == "html":
         st.html(text)
-
-if output_format == "json" and show_blocks:
-    with image_placeholder:
-        block_display(pil_image, text)
-
-if debug:
-    with col1:
-        debug_data_path = rendered.metadata.get("debug_data_path")
-        if debug_data_path:
-            pdf_image_path = os.path.join(debug_data_path, f"pdf_page_{first_page}.png")
-            img = Image.open(pdf_image_path)
-            st.image(img, caption="PDF debug image", use_container_width=True)
-            layout_image_path = os.path.join(debug_data_path, f"layout_page_{first_page}.png")
-            img = Image.open(layout_image_path)
-            st.image(img, caption="Layout debug image", use_container_width=True)
-        st.write("Raw output:")
-        st.code(text, language=output_format)
